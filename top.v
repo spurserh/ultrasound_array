@@ -62,6 +62,50 @@ EHXPLLL #(
     );
 endmodule
 
+module tft_driver(input clk, 
+    output tft_clk,
+    output hsync,
+    output vsync,
+    output de,
+    output reg [9:0] pos_x = 0,
+    output reg [9:0] pos_y = 0
+    );
+
+
+    localparam active_width = 480;
+    localparam total_width = 525;
+    localparam active_height = 272;
+    localparam total_height = 288;
+
+//    reg [9:0] pos_x = 0;
+//    reg [9:0] pos_y = 0;
+
+    reg slow_clk_reg = 0;
+    always @(posedge clk) begin
+
+//        if(slow_clk_reg == 0) begin
+            if(pos_y >= total_height) begin
+                pos_x <= 0;
+                pos_y <= 0;
+            end else begin
+                if(pos_x >= total_width) begin
+                    pos_x <= 0;
+                    pos_y <= pos_y + 1;
+                end else begin
+                    pos_x <= pos_x + 1;
+                end
+            end
+//        end
+
+        slow_clk_reg <= ~slow_clk_reg;
+    end
+
+    assign hsync = ~(pos_x > (active_width-1));
+    assign vsync = ~(pos_y > (active_height-1));
+    assign de = hsync;
+    assign tft_clk = clk;
+endmodule
+
 module LFSR_rng
 (
     input clk,
@@ -102,7 +146,25 @@ module diff_sampler(
             end
         end
     end
+endmodule
 
+module selector(
+    input [2:0] row,
+    input [2:0] col,
+    output [1:0] uplex,
+    output [3:0] uinput
+    );
+
+    wire [3:0] rrow = row;
+    wire [3:0] rcol = col;
+
+    // 0 is the last with only one row
+    wire [1:0] urow = 3 - (rrow / 2);
+
+    // urow pins are reversed
+    assign uplex[0] = urow[0];
+    assign uplex[1] = urow[1];
+    assign uinput = rcol + ((rrow) % 2) * 9;
 
 endmodule
 
@@ -112,10 +174,14 @@ module top(input clk, output [7:0] led,
     input diff_in_sel,
     input diff_in_center,
     output diff_out,
-    output sw_out0,
-    output sw_out1,
     output [1:0] uplex,
-    output [3:0] uinput
+    output [3:0] uinput,
+    // TFT
+    output tft_clk,
+    output hsync,
+    output vsync,
+    output reg blue = 0,
+    output de
     );
 
 
@@ -154,18 +220,39 @@ module top(input clk, output [7:0] led,
         .diff_in(diff_in_sel),
         .sample_high_count_out(sample_out_count_sel));
 
+
+    reg [15:0] mixed = 0;
+    reg [31:0] last_mixed_accum = 0;
+    reg [31:0] mixed_accum = 0;
+    localparam mixed_accum_cycles = 1200;
+    reg [15:0] mixed_accum_count = 0;
+    always @(posedge pwm_clk) begin
+        mixed <= sample_out_count_sel * sample_out_count_center;
+
+        if (mixed_accum_count == mixed_accum_cycles) begin
+            mixed_accum_count <= 0;
+            last_mixed_accum <= mixed_accum;
+            mixed_accum <= 0;
+        end else begin
+            mixed_accum_count <= mixed_accum_count + 1;
+            mixed_accum <= mixed_accum + mixed;
+        end
+    end
+
     wire [31:0] rand_out;
     LFSR_rng rng(.clk(pwm_clk), .rand_out(rand_out));
 
 
-    assign sw_out0 = c[22];
-    assign sw_out1 = 0;
-//    assign sw_out1 = ~c[22]; 
-
     reg [2:0] rrowc = 0;
     reg [2:0] rcolc = 0;
     
-    always @(posedge c[21]) begin
+    reg [15:0] display[7][7];
+
+//    always @(posedge c[21]) begin
+    always @(posedge c[14]) begin
+        // TODO: Magic
+        display[rrowc][rcolc] <= last_mixed_accum >> 16;
+
         if (rcolc == 6) begin
             rcolc <= 0;
             if (rrowc == 6) begin
@@ -179,19 +266,60 @@ module top(input clk, output [7:0] led,
     end
 
 
-    wire [3:0] rrow = rrowc;
-    wire [3:0] rcol = rcolc;
+    selector selector(
+//        .row(rrowc),
+//        .col(rcolc),
+        .row(rrowc),
+        .col(rcolc),
+        .uplex(uplex),
+        .uinput(uinput)
+    );
 
-    // 0 is the last with only one row
-    wire [1:0] urow = 3 - (rrow / 2);
 
-    // urow pins are reversed
-    assign uplex[0] = urow[0];
-    assign uplex[1] = urow[1];
-    assign uinput = rcol + ((rrow) % 2) * 9;
 
-    assign diff_out = (sample_out_count_sel > rand_out[6:0]);
-    assign led = (rrow == 3) && (rcol == 3);
+
+//    assign diff_out = (sample_out_count_sel > rand_out[6:0]);
+    assign diff_out = (mixed > rand_out[6:0]);
+//    assign led = (rrow == 3) && (rcol == 3);
+    assign led = 0;
+
+
+    wire [9:0] pos_x;
+    wire [9:0] pos_y;
+
+    tft_driver tft_driver(.clk(clk), 
+        .tft_clk(tft_clk),
+        .hsync(hsync),
+        .vsync(vsync),
+        .de(de),
+        .pos_x(pos_x),
+        .pos_y(pos_y));
+
+
+    reg [22:0] timer = 0;
+
+    always @(posedge clk) begin
+        timer <= timer + 1;
+    end
+
+//    wire [9:0] added_x = pos_x + timer[22:19];
+//    wire [9:0] added_y = pos_y + timer[22:19];
+//    assign blue = added_x[3] ^ added_y[3];
+
+    wire [31:0] rand_out_slow;
+    LFSR_rng rng_slow(.clk(clk), .rand_out(rand_out_slow));
+
+
+    always @(posedge clk) begin
+//        blue <= (mixed > rand_out_fast[6:0]);
+        if (pos_x < (32*7) && (pos_y < (32*7))) begin
+            // TODO: Magic
+            blue <= display[7 - pos_y / 32][7 - pos_x / 32] > rand_out_slow[6:0];
+        end else begin
+            blue <= 0;
+        end
+    end
+
 
 endmodule
 
