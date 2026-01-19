@@ -121,15 +121,17 @@ module LFSR_rng
         end
 endmodule
 
-module diff_sampler(
+module diff_sampler
+#(
+    parameter sampling_cycles = 128
+)
+(
     input pwm_clk,
     input diff_in,
     output [15:0] sample_high_count_out);
 
     reg [15:0] last_sample_high_count = 0;
     assign sample_high_count_out = last_sample_high_count;
-
-    localparam sampling_cycles = 128;
 
     reg [15:0] sampling_counter = sampling_cycles - 1;
     reg [15:0] sample_high_count = 0;
@@ -146,6 +148,52 @@ module diff_sampler(
             end
         end
     end
+endmodule
+
+module mixing_sampler
+#(
+    parameter max_cycles = 128,
+    parameter high_cycles = 64
+)
+(
+    input pwm_clk,
+    input in_a,
+    input in_b,
+    output reg [15:0] high_count_out = 0);
+
+    reg [15:0] cycles = 0;
+    reg [15:0] high_count_a = 0;
+    reg [15:0] high_count_b = 0;
+    reg [15:0] high_count_mixed = 0;
+
+    // 100% should be when the mixed signal has as many highs
+    // as the least active signal.
+
+    // actually runs for cycles + 1, one reset cycle is simpler
+    always @(posedge pwm_clk) begin
+        if (cycles == max_cycles || 
+            high_count_a == high_cycles || 
+            high_count_b == high_cycles) begin
+            high_count_out <= high_count_mixed;
+            cycles <= 0;
+            high_count_a <= 0;
+            high_count_b <= 0;
+            high_count_mixed <= 0;
+        end else begin
+            cycles <= cycles + 1;
+            if (in_a) begin
+                high_count_a <= high_count_a + 1;
+            end
+            if (in_b) begin
+                high_count_b <= high_count_b + 1;
+            end
+            if (in_a & in_b) begin
+                high_count_mixed <= high_count_mixed + 1;
+            end
+
+        end
+    end
+
 endmodule
 
 module selector(
@@ -205,7 +253,7 @@ module top(input clk, output [7:0] led,
     end
 
     // Single 40khz cycle
-    localparam sampling_cycles = 128;
+//    localparam sampling_cycles = 128;
 
     wire [15:0] sample_out_count_center;
     wire [15:0] sample_out_count_sel;
@@ -220,27 +268,30 @@ module top(input clk, output [7:0] led,
         .diff_in(diff_in_sel),
         .sample_high_count_out(sample_out_count_sel));
 
+    wire [15:0] mixed_high_count_out;
 
-    reg [15:0] mixed = 0;
-    reg [31:0] last_mixed_accum = 0;
-    reg [31:0] mixed_accum = 0;
-    localparam mixed_accum_cycles = 1200;
-    reg [15:0] mixed_accum_count = 0;
-    always @(posedge pwm_clk) begin
-        mixed <= sample_out_count_sel * sample_out_count_center;
-
-        if (mixed_accum_count == mixed_accum_cycles) begin
-            mixed_accum_count <= 0;
-            last_mixed_accum <= mixed_accum;
-            mixed_accum <= 0;
-        end else begin
-            mixed_accum_count <= mixed_accum_count + 1;
-            mixed_accum <= mixed_accum + mixed;
-        end
-    end
+    mixing_sampler 
+    #(
+        .max_cycles(16384),
+        .high_cycles(4096)
+    )
+    mixing_sampler
+    (
+        .pwm_clk(pwm_clk),
+        .in_a(diff_in_center),
+        .in_b(diff_in_sel),
+//        .in_b(diff_in_center),
+        .high_count_out(mixed_high_count_out));
 
     wire [31:0] rand_out;
     LFSR_rng rng(.clk(pwm_clk), .rand_out(rand_out));
+
+    reg diff_out_r = 0;
+    always @(posedge pwm_clk) begin
+        diff_out_r <= diff_in_sel;
+    end
+    assign diff_out = diff_out_r;
+//    assign diff_out = mixed_high_count_out > rand_out[13:0];
 
 
     reg [2:0] rrowc = 0;
@@ -250,8 +301,8 @@ module top(input clk, output [7:0] led,
 
 //    always @(posedge c[21]) begin
     always @(posedge c[14]) begin
-        // TODO: Magic
-        display[rrowc][rcolc] <= last_mixed_accum >> 16;
+        display[rrowc][rcolc] <= mixed_high_count_out;
+//        display[rrowc][rcolc] <= (7 + rrowc * 7 + rcolc) << 6;
 
         if (rcolc == 6) begin
             rcolc <= 0;
@@ -267,10 +318,10 @@ module top(input clk, output [7:0] led,
 
 
     selector selector(
-//        .row(rrowc),
-//        .col(rcolc),
         .row(rrowc),
         .col(rcolc),
+//        .row(2),
+//        .col(3),
         .uplex(uplex),
         .uinput(uinput)
     );
@@ -279,7 +330,9 @@ module top(input clk, output [7:0] led,
 
 
 //    assign diff_out = (sample_out_count_sel > rand_out[6:0]);
-    assign diff_out = (mixed > rand_out[6:0]);
+//    assign diff_out = (mixed > rand_out[6:0]);
+
+
 //    assign led = (rrow == 3) && (rcol == 3);
     assign led = 0;
 
@@ -312,9 +365,9 @@ module top(input clk, output [7:0] led,
 
     always @(posedge clk) begin
 //        blue <= (mixed > rand_out_fast[6:0]);
-        if (pos_x < (32*7) && (pos_y < (32*7))) begin
+        if ((pos_x < (32*7)) && (pos_y < (32*7))) begin
             // TODO: Magic
-            blue <= display[7 - pos_y / 32][7 - pos_x / 32] > rand_out_slow[6:0];
+            blue <= display[6 - pos_y / 32][6 - pos_x / 32] > rand_out_slow[11:0];
         end else begin
             blue <= 0;
         end
